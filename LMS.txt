@@ -1,0 +1,429 @@
+package com.example.lab1_ccs3104;
+
+import javafx.application.Application;
+import javafx.application.Platform;
+import javafx.collections.FXCollections;
+import javafx.collections.ObservableList;
+import javafx.geometry.Insets;
+import javafx.scene.Scene;
+import javafx.scene.control.*;
+import javafx.scene.input.MouseButton;
+import javafx.scene.layout.*;
+import javafx.stage.FileChooser;
+import javafx.stage.Stage;
+
+import java.io.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * A single-file simple Learning Management System demo using JavaFX.
+ * Features:
+ * - Lecturer uploads Notes (files saved to ./storage/notes)
+ * - Students submit Assignments (files saved to ./storage/submissions)
+ * - Automatic deadline checking runs periodically and creates notifications
+ * - In-app notification system
+ * - Data persistence via Java Serialization (notes, assignments, submissions, notifications)
+ *
+ * To run: compile with Java 11+ and JavaFX on classpath.
+ */
+public class LMS_2 extends Application {
+
+    private static final Path STORAGE_DIR = Path.of("storage");
+    private static final Path NOTES_DIR = STORAGE_DIR.resolve("notes");
+    private static final Path SUBMISSIONS_DIR = STORAGE_DIR.resolve("submissions");
+    private static final Path DATA_DIR = STORAGE_DIR.resolve("data");
+
+    // Serialized data files
+    private static final File NOTES_DATA = DATA_DIR.resolve("notes.ser").toFile();
+    private static final File ASSIGNMENTS_DATA = DATA_DIR.resolve("assignments.ser").toFile();
+    private static final File SUBMISSIONS_DATA = DATA_DIR.resolve("submissions.ser").toFile();
+    private static final File NOTIFS_DATA = DATA_DIR.resolve("notifications.ser").toFile();
+
+    // in-memory lists
+    private final ObservableList<Note> notes = FXCollections.observableArrayList();
+    private final ObservableList<Assignment> assignments = FXCollections.observableArrayList();
+    private final ObservableList<Submission> submissions = FXCollections.observableArrayList();
+    private final ObservableList<Notification> notifications = FXCollections.observableArrayList();
+
+    private ScheduledExecutorService scheduler;
+
+    private ListView<Notification> notifListView;
+
+    public static void main(String[] args) {
+        launch(args);
+    }
+
+    @Override
+    public void start(Stage primaryStage) throws Exception {
+        ensureDirectories();
+        loadAll();
+
+        TabPane rootTabs = new TabPane();
+        Tab lecturerTab = new Tab("Lecturer");
+        Tab studentTab = new Tab("Student");
+        Tab adminTab = new Tab("Notifications");
+
+        lecturerTab.setContent(buildLecturerPane(primaryStage));
+        studentTab.setContent(buildStudentPane(primaryStage));
+        adminTab.setContent(buildNotificationsPane());
+
+        rootTabs.getTabs().addAll(lecturerTab, studentTab, adminTab);
+        rootTabs.setTabClosingPolicy(TabPane.TabClosingPolicy.UNAVAILABLE);
+
+        Scene scene = new Scene(rootTabs, 900, 600);
+        primaryStage.setScene(scene);
+        primaryStage.setTitle("Simple LMS - JavaFX Demo");
+        primaryStage.show();
+
+        // start scheduler for automatic deadline checking
+        scheduler = Executors.newSingleThreadScheduledExecutor();
+        scheduler.scheduleAtFixedRate(this::deadlineCheckAndNotify, 5, 10, TimeUnit.SECONDS);
+
+        primaryStage.setOnCloseRequest(e -> {
+            scheduler.shutdownNow();
+            saveAll();
+        });
+    }
+
+    private Pane buildLecturerPane(Stage stage) {
+        VBox root = new VBox(10);
+        root.setPadding(new Insets(12));
+
+        // Upload notes section
+        Label notesLabel = new Label("Upload Notes");
+        TextField noteTitle = new TextField();
+        noteTitle.setPromptText("Title");
+        Button chooseNoteBtn = new Button("Choose File & Upload");
+        ListView<Note> notesList = new ListView<>(notes);
+        notesList.setPrefHeight(150);
+
+        chooseNoteBtn.setOnAction(evt -> {
+            FileChooser fc = new FileChooser();
+            File selected = fc.showOpenDialog(stage);
+            if (selected != null) {
+                String title = noteTitle.getText().isBlank() ? selected.getName() : noteTitle.getText();
+                try {
+                    Path dest = NOTES_DIR.resolve(UUID.randomUUID() + "_" + selected.getName());
+                    Files.copy(selected.toPath(), dest, StandardCopyOption.REPLACE_EXISTING);
+                    Note n = new Note(title, dest.toString(), LocalDateTime.now());
+                    notes.add(n);
+                    saveNotes();
+                    addNotification(new Notification("New note uploaded: " + title, LocalDateTime.now()));
+                    noteTitle.clear();
+                } catch (IOException ex) {
+                    alert("Error copying file: " + ex.getMessage());
+                }
+            }
+        });
+
+        // Create assignment section
+        Label assignmentLabel = new Label("Create Assignment (with deadline)");
+        TextField assignTitle = new TextField();
+        assignTitle.setPromptText("Assignment Title");
+        DatePicker datePicker = new DatePicker();
+        TextField timeField = new TextField();
+        timeField.setPromptText("HH:mm (24h)");
+        Button createAssign = new Button("Create Assignment");
+        ListView<Assignment> assignmentList = new ListView<>(assignments);
+        assignmentList.setPrefHeight(150);
+
+        createAssign.setOnAction(evt -> {
+            String title = assignTitle.getText().isBlank() ? "Untitled" : assignTitle.getText();
+            if (datePicker.getValue() == null || timeField.getText().isBlank()) {
+                alert("Please pick date and time for the deadline");
+                return;
+            }
+            try {
+                String[] parts = timeField.getText().split(":");
+                int hh = Integer.parseInt(parts[0]);
+                int mm = Integer.parseInt(parts[1]);
+                LocalDateTime deadline = datePicker.getValue().atTime(hh, mm);
+                Assignment a = new Assignment(title, deadline);
+                assignments.add(a);
+                saveAssignments();
+                addNotification(new Notification("New assignment created: " + title, LocalDateTime.now()));
+                assignTitle.clear();
+            } catch (Exception ex) {
+                alert("Time format invalid. Use HH:mm");
+            }
+        });
+
+        // layout
+        HBox upBox = new HBox(8, noteTitle, chooseNoteBtn);
+        HBox assignBox = new HBox(8, assignTitle, datePicker, timeField, createAssign);
+        root.getChildren().addAll(notesLabel, upBox, notesList, new Separator(), assignmentLabel, assignBox, assignmentList);
+
+        // context menu for notes to open file or delete
+        notesList.setCellFactory(lv -> new ListCell<>() {
+            @Override
+            protected void updateItem(Note item, boolean empty) {
+                super.updateItem(item, empty);
+                if (empty || item == null) setText(null);
+                else setText(item.title + " (" + item.uploaded.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")) + ")");
+            }
+        });
+
+        notesList.setOnMouseClicked(e -> {
+            if (e.getButton() == MouseButton.SECONDARY) {
+                Note sel = notesList.getSelectionModel().getSelectedItem();
+                if (sel == null) return;
+                ContextMenu cm = new ContextMenu();
+                MenuItem open = new MenuItem("Open File Path");
+                open.setOnAction(a -> {
+                    alert("File: " + sel.filepath);
+                });
+                MenuItem del = new MenuItem("Delete");
+                del.setOnAction(a -> {
+                    notes.remove(sel);
+                    saveNotes();
+                });
+                cm.getItems().addAll(open, del);
+                cm.show(notesList, e.getScreenX(), e.getScreenY());
+            }
+        });
+
+        return root;
+    }
+
+    private Pane buildStudentPane(Stage stage) {
+        VBox root = new VBox(10);
+        root.setPadding(new Insets(12));
+
+        Label availableNotes = new Label("Available Notes");
+        ListView<Note> notesList = new ListView<>(notes);
+        notesList.setPrefHeight(150);
+
+        Label assignmentsLabel = new Label("Assignments (submit by deadline)");
+        ListView<Assignment> assignmentList = new ListView<>(assignments);
+        assignmentList.setPrefHeight(150);
+
+        Button submitBtn = new Button("Submit Selected Assignment");
+        submitBtn.setOnAction(e -> {
+            Assignment sel = assignmentList.getSelectionModel().getSelectedItem();
+            if (sel == null) { alert("Choose an assignment to submit"); return; }
+            FileChooser fc = new FileChooser();
+            File f = fc.showOpenDialog(stage);
+            if (f == null) return;
+            try {
+                Path dest = SUBMISSIONS_DIR.resolve(UUID.randomUUID() + "_" + f.getName());
+                Files.copy(f.toPath(), dest, StandardCopyOption.REPLACE_EXISTING);
+                Submission s = new Submission(sel.id, f.getName(), dest.toString(), LocalDateTime.now());
+                submissions.add(s);
+                saveSubmissions();
+                addNotification(new Notification("Submission received for: " + sel.title + " (" + f.getName() + ")", LocalDateTime.now()));
+            } catch (IOException ex) {
+                alert("Error copying submission: " + ex.getMessage());
+            }
+        });
+
+        ListView<Submission> submissionList = new ListView<>(submissions);
+        submissionList.setPrefHeight(150);
+
+        // show submission status style
+        assignmentList.setCellFactory(lv -> new ListCell<>() {
+            @Override
+            protected void updateItem(Assignment item, boolean empty) {
+                super.updateItem(item, empty);
+                if (empty || item == null) setText(null);
+                else {
+                    String status = "Open";
+                    if (item.deadline.isBefore(LocalDateTime.now())) status = "Closed";
+                    setText(item.title + " - Due: " + item.deadline.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")) + " (" + status + ")");
+                }
+            }
+        });
+
+        root.getChildren().addAll(availableNotes, notesList, new Separator(), assignmentsLabel, assignmentList, submitBtn, new Label("All Submissions"), submissionList);
+        return root;
+    }
+
+    private Pane buildNotificationsPane() {
+        VBox root = new VBox(8);
+        root.setPadding(new Insets(12));
+        notifListView = new ListView<>(notifications);
+        notifListView.setPrefHeight(500);
+        Button clearBtn = new Button("Clear Notifications");
+        clearBtn.setOnAction(e -> {
+            notifications.clear();
+            saveNotifications();
+        });
+        root.getChildren().addAll(new Label("Notifications"), notifListView, clearBtn);
+        return root;
+    }
+
+    private void ensureDirectories() throws IOException {
+        Files.createDirectories(NOTES_DIR);
+        Files.createDirectories(SUBMISSIONS_DIR);
+        Files.createDirectories(DATA_DIR);
+    }
+
+    // --- Persistence ---
+    @SuppressWarnings("unchecked")
+    private void loadAll() {
+        try {
+            if (NOTES_DATA.exists()) {
+                Object o = deserialize(NOTES_DATA);
+                if (o instanceof List<?>) notes.addAll((List<Note>) o);
+            }
+            if (ASSIGNMENTS_DATA.exists()) {
+                Object o = deserialize(ASSIGNMENTS_DATA);
+                if (o instanceof List<?>) assignments.addAll((List<Assignment>) o);
+            }
+            if (SUBMISSIONS_DATA.exists()) {
+                Object o = deserialize(SUBMISSIONS_DATA);
+                if (o instanceof List<?>) submissions.addAll((List<Submission>) o);
+            }
+            if (NOTIFS_DATA.exists()) {
+                Object o = deserialize(NOTIFS_DATA);
+                if (o instanceof List<?>) notifications.addAll((List<Notification>) o);
+            }
+        } catch (Exception e) {
+            System.err.println("Error loading data: " + e.getMessage());
+        }
+    }
+
+    private void saveAll() {
+        saveNotes();
+        saveAssignments();
+        saveSubmissions();
+        saveNotifications();
+    }
+
+    private void saveNotes() {
+        serialize(new ArrayList<>(notes), NOTES_DATA);
+    }
+
+    private void saveAssignments() {
+        serialize(new ArrayList<>(assignments), ASSIGNMENTS_DATA);
+    }
+
+    private void saveSubmissions() {
+        serialize(new ArrayList<>(submissions), SUBMISSIONS_DATA);
+    }
+
+    private void saveNotifications() {
+        serialize(new ArrayList<>(notifications), NOTIFS_DATA);
+    }
+
+    private void serialize(Object obj, File file) {
+        try (ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(file))) {
+            oos.writeObject(obj);
+        } catch (IOException e) {
+            System.err.println("Serialize error: " + e.getMessage());
+        }
+    }
+
+    private Object deserialize(File file) {
+        try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream(file))) {
+            return ois.readObject();
+        } catch (IOException | ClassNotFoundException e) {
+            System.err.println("Deserialize error: " + e.getMessage());
+            return null;
+        }
+    }
+
+    // --- Deadline checking ---
+    private void deadlineCheckAndNotify() {
+        LocalDateTime now = LocalDateTime.now();
+        for (Assignment a : assignments) {
+            if (!a.deadlineNotified && a.deadline.isBefore(now)) {
+                a.deadlineNotified = true;
+                addNotification(new Notification("Assignment closed: " + a.title + " (deadline passed)", now));
+            } else if (!a.reminderSent && a.deadline.minusMinutes(30).isBefore(now) && a.deadline.isAfter(now)) {
+                // send a reminder 30 minutes before deadline
+                a.reminderSent = true;
+                addNotification(new Notification("Reminder: Assignment due soon: " + a.title + " at " + a.deadline.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")), now));
+            }
+        }
+        // persist any changes
+        saveAssignments();
+    }
+
+    private void addNotification(Notification n) {
+        Platform.runLater(() -> {
+            notifications.add(0, n);
+            saveNotifications();
+        });
+    }
+
+    private void alert(String msg) {
+        Platform.runLater(() -> {
+            Alert a = new Alert(Alert.AlertType.INFORMATION, msg, ButtonType.OK);
+            a.showAndWait();
+        });
+    }
+
+    // --- Data classes ---
+    private static class Note implements Serializable {
+        private static final long serialVersionUID = 1L;
+        String title;
+        String filepath;
+        LocalDateTime uploaded;
+
+        public Note(String title, String filepath, LocalDateTime uploaded) {
+            this.title = title;
+            this.filepath = filepath;
+            this.uploaded = uploaded;
+        }
+
+        @Override
+        public String toString() { return title; }
+    }
+
+    private static class Assignment implements Serializable {
+        private static final long serialVersionUID = 1L;
+        final String id = UUID.randomUUID().toString();
+        String title;
+        LocalDateTime deadline;
+        boolean deadlineNotified = false;
+        boolean reminderSent = false;
+
+        public Assignment(String title, LocalDateTime deadline) {
+            this.title = title;
+            this.deadline = deadline;
+        }
+
+        @Override
+        public String toString() { return title; }
+    }
+
+    private static class Submission implements Serializable {
+        private static final long serialVersionUID = 1L;
+        String assignmentId;
+        String originalFilename;
+        String filepath;
+        LocalDateTime submittedAt;
+
+        public Submission(String assignmentId, String originalFilename, String filepath, LocalDateTime submittedAt) {
+            this.assignmentId = assignmentId;
+            this.originalFilename = originalFilename;
+            this.filepath = filepath;
+            this.submittedAt = submittedAt;
+        }
+
+        @Override
+        public String toString() { return originalFilename + " (" + submittedAt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")) + ")"; }
+    }
+
+    private static class Notification implements Serializable {
+        private static final long serialVersionUID = 1L;
+        String message;
+        LocalDateTime time;
+
+        public Notification(String message, LocalDateTime time) {
+            this.message = message;
+            this.time = time;
+        }
+
+        @Override
+        public String toString() { return time.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")) + " - " + message; }
+    }
+}
